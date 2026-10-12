@@ -240,6 +240,40 @@ async function fetchWebpConverted(tgFileUrl) {
   });
 }
 
+// 【补丁 2026-10-12】Telegram 接口 429 自动等待重试
+// 背景：Telegram 对同一频道限制约「每分钟 20 条消息」，超限时返回 429，
+//       响应体里带 parameters.retry_after（还需要等多少秒）。
+//       原代码直接把 429 抛出去，导致批量上传中途丢图、链接与文件名错位。
+async function fetchTelegramWithRetry(url, options, maxRetry = 3, totalBudgetSec = 60) {
+  let lastResp;
+  let spent = 0;
+  for (let attempt = 0; ; attempt++) {
+    lastResp = await fetch(url, options);
+    if (lastResp.status !== 429 || attempt >= maxRetry) return lastResp;
+
+    // 解析 Telegram 给的等待秒数；拿不到就用兜底值
+    let waitSec = 0;
+    try {
+      const body = await lastResp.clone().json();
+      waitSec = Number(body && body.parameters && body.parameters.retry_after) || 0;
+      if (!waitSec) {
+        const m = String((body && body.description) || "").match(/retry after (\d+)/i);
+        if (m) waitSec = Number(m[1]);
+      }
+    } catch {}
+    if (!waitSec) waitSec = 5;
+    waitSec += 1; // 多等 1 秒更保险
+
+    if (spent + waitSec > totalBudgetSec) {
+      console.log("[warn] Telegram 限流，但累计等待将超过 " + totalBudgetSec + " 秒，放弃重试");
+      return lastResp;
+    }
+    spent += waitSec;
+    console.log("[warn] Telegram 限流(429)：等待 " + waitSec + " 秒后重试（第 " + (attempt + 1) + "/" + maxRetry + " 次）");
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
+  }
+}
+
 // 处理文件上传
 async function handleUploadRequest(request, config) {
   if (request.method === "GET") {
@@ -271,12 +305,16 @@ async function handleUploadRequest(request, config) {
     const tgFormData = new FormData();
     tgFormData.append("chat_id", config.tgChatId);
     tgFormData.append(field, file, file.name);
-    const tgResponse = await fetch(`${config.tgApiBase}/bot${config.tgBotToken}/${method}`, {
+    // 【补丁 2026-10-12】改用带 429 自动重试的调用
+    const tgResponse = await fetchTelegramWithRetry(`${config.tgApiBase}/bot${config.tgBotToken}/${method}`, {
       method: "POST",
       body: tgFormData,
     });
     if (!tgResponse.ok) {
       const errorText = await tgResponse.text();
+      if (tgResponse.status === 429) {
+        throw new Error(`Telegram 限流（429）—— 同一频道约每分钟最多 20 条消息，请等 1 分钟再传、或一次少传几张。原始信息: ${errorText}`);
+      }
       throw new Error(`Telegram API调用失败 (状态码: ${tgResponse.status}): ${errorText}`);
     }
 
@@ -297,14 +335,17 @@ async function handleUploadRequest(request, config) {
     const useWebpMode = config.webpEnabled && isConvertibleImage;
     const isImageType = mainType === "image"; // 广义图片（含 webp/svg 等不可转换的）
     // 生成文件访问 URL
+    // 【补丁 2026-10-12】图片也改用「原文件名」命名，保证 上传顺序 === 文件名顺序
+    //   例：001.jpg  ->  https://<域名>/001.jpg
+    //   无文件名 / 无扩展名时（例如直接粘贴的图片）回退为时间戳命名
     let originalUrl;
-    if (isImageType) {
-      originalUrl = `https://${config.domain}/${time}.${ext}`;
-    } else {
-      // 非图片文件使用原文件名，同名文件直接覆盖
-      const safeName = encodeURIComponent(file.name);
-      originalUrl = `https://${config.domain}/${safeName}`;
-      // 清除旧的 DB 记录和缓存，实现覆盖
+    const rawName = (file.name || "").trim();
+    const hasExt = /\.[A-Za-z0-9]{1,8}$/.test(rawName);
+    const safeName = hasExt ? encodeURIComponent(rawName) : `${time}.${ext || "bin"}`;
+    originalUrl = `https://${config.domain}/${safeName}`;
+
+    // 同名覆盖：url 是主键(PRIMARY KEY)，必须先删旧记录，否则 INSERT 会失败
+    {
       const old = await config.database
         .prepare("SELECT url, webp_url, fileId, message_id FROM files WHERE url = ?")
         .bind(originalUrl)
