@@ -21,6 +21,12 @@ async function initDatabase(config) {
     `,
       )
       .run();
+    // 【补丁⑧】为「隐藏」功能补一列（幂等：列已存在时报错可忽略）
+    try {
+      await config.database.prepare("ALTER TABLE files ADD COLUMN hidden INTEGER DEFAULT 0").run();
+    } catch (e) {
+      // 列已存在，忽略
+    }
     isDatabaseInitialized = true;
   } catch (error) {
     console.error("[error] Database initialization failed:", error);
@@ -79,6 +85,7 @@ export default {
       "/admin": () => handleAdminRequest(request, config),
       "/delete": () => handleDeleteRequest(request, config),
       "/delete-batch": () => handleBatchDeleteRequest(request, config), // 【补丁④】批量删除
+      "/hide": () => handleHideRequest(request, config), // 【补丁⑧】隐藏 / 取消隐藏
       "/search": () => handleSearchRequest(request, config),
     };
     const handler = routes[pathname];
@@ -373,7 +380,12 @@ async function handleUploadRequest(request, config) {
       const dot = rawName.lastIndexOf(".");
       safeName = `${encodeURIComponent(rawName.slice(0, dot))}-${time}${rawName.slice(dot)}`;
     } else {
-      safeName = `${time}.${ext || "bin"}`;
+      // 【补丁⑧】文件名没有可用扩展名时：用 MIME 类型推断扩展名，并保留文件名前缀
+      //   例：名为「图片」(image/jpeg) -> 图片-1791xxx.jpg   （改前会变成 1791xxx.图片 这种怪名字）
+      //       名为空（粘贴的图片）    -> 1791xxx.jpg
+      const MIME_EXT = { "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp", "video/mp4": "mp4", "video/webm": "webm", "audio/mpeg": "mp3", "audio/wav": "wav", "application/pdf": "pdf" };
+      const mimeExt = MIME_EXT[String(file.type || "").toLowerCase()] || (ext && ext !== rawName ? ext : "") || "bin";
+      safeName = `${rawName ? encodeURIComponent(rawName) + "-" : ""}${time}.${mimeExt}`;
     }
     originalUrl = `https://${config.domain}/${safeName}`;
 
@@ -469,13 +481,46 @@ async function handleUploadRequest(request, config) {
   }
 }
 
+// 【补丁⑧】隐藏 / 取消隐藏
+// 只改 D1 里的一个标记：记录主体和 Telegram 消息都保留 => 链接永久有效
+async function handleHideRequest(request, config) {
+  try {
+    const { urls, hidden } = await request.json();
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return new Response(JSON.stringify({ error: "无效的URL列表" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const flag = hidden === false ? 0 : 1;
+    let changed = 0;
+    for (const url of urls) {
+      if (typeof url !== "string") continue;
+      const r = await config.database.prepare("UPDATE files SET hidden = ? WHERE url = ? OR webp_url = ?").bind(flag, url, url).run();
+      changed += (r && r.meta && r.meta.changes) || 0;
+    }
+    return new Response(
+      JSON.stringify({ success: true, total: urls.length, changed, hidden: flag === 1 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  } catch (error) {
+    console.error("[error] Hide request failed:", error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
 // 处理文件管理和预览
 async function handleAdminRequest(request, config) {
   try {
+    // 【补丁⑧】默认只列出未隐藏的；带 ?hidden=1 时把已隐藏的也列出来
+    const showHidden = new URL(request.url).searchParams.get("hidden") === "1";
     const files = await config.database
       .prepare(
-        `SELECT url, webp_url, fileId, message_id, created_at, file_name, webp_file_name, file_size, mime_type
+        `SELECT url, webp_url, fileId, message_id, created_at, file_name, webp_file_name, file_size, mime_type, COALESCE(hidden, 0) AS hidden
         FROM files
+        ${showHidden ? "" : "WHERE COALESCE(hidden, 0) = 0"}
         ORDER BY created_at DESC`,
       )
       .all();
@@ -494,11 +539,14 @@ async function handleAdminRequest(request, config) {
           displayFileName = file.webp_file_name;
         }
 
+        const isHidden = Number(file.hidden) === 1; // 【补丁⑧】
         return `
-        <div class="file-card" data-url="${file.url}">
-          <label class="card-pick" title="选择此项（用于批量删除）">
+        <div class="file-card${isHidden ? " is-hidden" : ""}" data-url="${file.url}">
+          <label class="card-pick" title="选择此项（用于批量操作）">
             <input type="checkbox" class="card-check" data-check="${file.url}">
           </label>
+          <button class="card-hide-btn" title="${isHidden ? "取消隐藏" : "隐藏（链接仍然有效）"}" onclick="hideFile('${file.url}', ${isHidden ? "false" : "true"})"><i class="fas fa-eye${isHidden ? "" : "-slash"}"></i></button>
+          ${isHidden ? '<span class="hidden-badge"><i class="fas fa-eye-slash"></i> 已隐藏</span>' : ""}
           <div class="file-preview">
             ${getPreviewHtml(displayUrl, file.mime_type)}
           </div>
@@ -1830,6 +1878,22 @@ function generateAdminPage(fileCards, qrModal) {
       .card-pick input { width: 16px; height: 16px; cursor: pointer; margin: 0; }
       .file-card.selected { outline: 3px solid #dc3545; outline-offset: -3px; }
 
+      /* 【补丁⑧】隐藏功能样式 */
+      .file-card.is-hidden { opacity: 0.55; }
+      .hidden-badge {
+        position: absolute; top: 10px; right: 44px; z-index: 5;
+        background: rgba(0,0,0,0.7); color: #fff; font-size: 11px;
+        padding: 3px 8px; border-radius: 20px;
+      }
+      .card-hide-btn {
+        position: absolute; top: 8px; right: 8px; z-index: 6;
+        width: 26px; height: 26px; border: none; border-radius: 6px;
+        background: rgba(255,255,255,0.9); color: #555; cursor: pointer;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+      }
+      .card-hide-btn:hover { background: #fff; color: #111; }
+      .btn-hide { background: #6c757d; color: #fff; }
+
       .qr-modal {
         display: none;
         position: fixed;
@@ -1976,6 +2040,7 @@ function generateAdminPage(fileCards, qrModal) {
     <div class="container">
       <div class="header">
         <h2><i class="fas fa-list"></i> 文件管理</h2>
+        <a href="${showHidden ? "/admin" : "/admin?hidden=1"}" class="backup"><i class="fas fa-eye${showHidden ? "" : "-slash"}"></i> ${showHidden ? "只看未隐藏" : "显示已隐藏"}</a>
         <a href="/upload" class="backup"><i class="fas fa-arrow-left"></i> 返回</a>
         <div class="search-wrapper">
           <i class="fas fa-magnifying-glass"></i>
@@ -1987,6 +2052,8 @@ function generateAdminPage(fileCards, qrModal) {
         <label class="batch-all"><input type="checkbox" id="selectAllCheck"> 全选本页</label>
         <span id="batchCount" class="batch-count">已选 0 项</span>
         <button class="btn btn-delete" id="batchDeleteBtn" disabled><i class="fas fa-trash"></i> 批量删除所选</button>
+        <button class="btn btn-hide" id="batchHideBtn" disabled><i class="fas fa-eye-slash"></i> 隐藏所选</button>
+        <button class="btn batch-clear" id="batchUnhideBtn" disabled><i class="fas fa-eye"></i> 取消隐藏</button>
         <button class="btn batch-clear" id="batchClearBtn"><i class="fas fa-xmark"></i> 取消选择</button>
         <span class="batch-hint">提示：一次最多 100 个</span>
       </div>
@@ -2161,6 +2228,7 @@ function generateAdminPage(fileCards, qrModal) {
           const cb = card.querySelector('.card-check');
           card.classList.toggle('selected', !!(cb && cb.checked));
         });
+        syncHideButtons(); // 【补丁⑧】
       }
       document.addEventListener('change', function (e) {
         if (e.target && e.target.classList && e.target.classList.contains('card-check')) updateBatchUI();
@@ -2214,6 +2282,79 @@ function generateAdminPage(fileCards, qrModal) {
           }
         });
       }
+      // -------------------- 【补丁⑧】隐藏 / 取消隐藏 --------------------
+      function syncHideButtons() {
+        const n = getCheckedUrls().length;
+        const bh = document.getElementById('batchHideBtn');
+        const bu = document.getElementById('batchUnhideBtn');
+        if (bh) bh.disabled = n === 0;
+        if (bu) bu.disabled = n === 0;
+      }
+      async function doHide(urls, hidden) {
+        try {
+          const resp = await fetch('/hide', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ urls: urls, hidden: hidden })
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || '操作失败');
+          return data;
+        } catch (e) {
+          await showAlert('操作失败: ' + e.message, '失败', 'error');
+          return null;
+        }
+      }
+      async function hideFile(url, hidden) {
+        const card = document.querySelector('.file-card[data-url="' + url + '"]');
+        const name = card ? card.querySelector('.file-info div:first-child').textContent : '此文件';
+        const ok = await showConfirm((hidden ? '确定要隐藏 ' : '确定要取消隐藏 ') + name + ' 吗？隐藏后链接依然有效，只是不在列表里显示。', hidden ? '隐藏确认' : '取消隐藏确认');
+        if (!ok) return;
+        const r = await doHide([url], hidden);
+        if (!r) return;
+        if (hidden && card) {
+          card.remove();
+          fileCards = Array.from(fileGrid.children);
+          renderPage(currentPage);
+        } else if (!hidden && card) {
+          card.classList.remove('is-hidden');
+          const b = card.querySelector('.hidden-badge');
+          if (b) b.remove();
+        }
+        updateBatchUI();
+        await showAlert(hidden ? (name + ' 已隐藏（链接仍然有效）') : (name + ' 已取消隐藏'), hidden ? '已隐藏' : '已取消隐藏', 'success');
+      }
+      function bindHideBatch(btnId, hidden) {
+        const btn = document.getElementById(btnId);
+        if (!btn) return;
+        btn.addEventListener('click', async function () {
+          const urls = getCheckedUrls();
+          if (urls.length === 0) return;
+          const tip = hidden ? '确定要隐藏选中的 ' + urls.length + ' 个文件吗？隐藏后链接依然有效，只是不在列表里显示。' : '确定要取消隐藏选中的 ' + urls.length + ' 个文件吗？';
+          if (!(await showConfirm(tip, hidden ? '批量隐藏' : '批量取消隐藏'))) return;
+          const r = await doHide(urls, hidden);
+          if (!r) return;
+          if (hidden) {
+            document.querySelectorAll('.file-card').forEach(function (card) {
+              if (urls.indexOf(card.getAttribute('data-url')) !== -1) card.remove();
+            });
+            fileCards = Array.from(fileGrid.children);
+            renderPage(currentPage);
+          } else {
+            document.querySelectorAll('.file-card').forEach(function (card) {
+              if (urls.indexOf(card.getAttribute('data-url')) !== -1) {
+                card.classList.remove('is-hidden');
+                const b = card.querySelector('.hidden-badge');
+                if (b) b.remove();
+              }
+            });
+          }
+          updateBatchUI();
+          await showAlert((hidden ? '已隐藏 ' : '已取消隐藏 ') + r.changed + ' / ' + r.total + ' 个', hidden ? '批量隐藏' : '批量取消隐藏', 'success');
+        });
+      }
+      bindHideBatch('batchHideBtn', true);
+      bindHideBatch('batchUnhideBtn', false);
       // -------------------- 初始渲染 --------------------
       renderPage(currentPage);
 
