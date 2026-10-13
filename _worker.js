@@ -360,13 +360,21 @@ async function handleUploadRequest(request, config) {
     const useWebpMode = config.webpEnabled && isConvertibleImage;
     const isImageType = mainType === "image"; // 广义图片（含 webp/svg 等不可转换的）
     // 生成文件访问 URL
-    // 【补丁 2026-10-12】图片也改用「原文件名」命名，保证 上传顺序 === 文件名顺序
-    //   例：001.jpg  ->  https://<域名>/001.jpg
-    //   无文件名 / 无扩展名时（例如直接粘贴的图片）回退为时间戳命名
+    // 【补丁①⑦】用「原文件名 + 毫秒时间戳」命名：
+    //   - 前缀 = 原文件名  -> 排序/识别依然按文件名（上传顺序由补丁⑤ 保证）
+    //   - 后缀 = 时间戳    -> 同名文件不再互相覆盖，每次上传都得到**全新链接**
+    //   例：001.jpg  ->  https://<域名>/001-1791814062238.jpg
+    //   无文件名 / 无扩展名时（例如直接粘贴的图片）回退为纯时间戳命名
     let originalUrl;
     const rawName = (file.name || "").trim();
     const hasExt = /\.[A-Za-z0-9]{1,8}$/.test(rawName);
-    const safeName = hasExt ? encodeURIComponent(rawName) : `${time}.${ext || "bin"}`;
+    let safeName;
+    if (hasExt) {
+      const dot = rawName.lastIndexOf(".");
+      safeName = `${encodeURIComponent(rawName.slice(0, dot))}-${time}${rawName.slice(dot)}`;
+    } else {
+      safeName = `${time}.${ext || "bin"}`;
+    }
     originalUrl = `https://${config.domain}/${safeName}`;
 
     // 同名覆盖：url 是主键(PRIMARY KEY)，必须先删旧记录，否则 INSERT 会失败
