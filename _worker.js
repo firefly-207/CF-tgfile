@@ -78,6 +78,7 @@ export default {
       "/upload": () => handleUploadRequest(request, config),
       "/admin": () => handleAdminRequest(request, config),
       "/delete": () => handleDeleteRequest(request, config),
+      "/delete-batch": () => handleBatchDeleteRequest(request, config), // 【补丁④】批量删除
       "/search": () => handleSearchRequest(request, config),
     };
     const handler = routes[pathname];
@@ -463,6 +464,9 @@ async function handleAdminRequest(request, config) {
 
         return `
         <div class="file-card" data-url="${file.url}">
+          <label class="card-pick" title="选择此项（用于批量删除）">
+            <input type="checkbox" class="card-check" data-check="${file.url}">
+          </label>
           <div class="file-preview">
             ${getPreviewHtml(displayUrl, file.mime_type)}
           </div>
@@ -621,6 +625,82 @@ async function handleFileRequest(request, config) {
   }
 }
 
+// 【补丁④】处理批量删除
+async function handleBatchDeleteRequest(request, config) {
+  try {
+    const { urls } = await request.json();
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return new Response(JSON.stringify({ error: "无效的URL列表" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const list = urls.filter((u) => typeof u === "string");
+    if (list.length > 100) {
+      return new Response(JSON.stringify({ error: "一次最多删除 100 个文件，请分批操作（当前 " + list.length + " 个）" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const results = [];
+    for (let i = 0; i < list.length; i++) {
+      const url = list[i];
+      let ok = false;
+      let msg = "";
+      try {
+        const file = await config.database
+          .prepare("SELECT fileId, message_id, webp_url FROM files WHERE url = ? OR webp_url = ?")
+          .bind(url, url)
+          .first();
+        if (!file) {
+          msg = "数据库中无此记录";
+        } else {
+          // 删除 Telegram 消息（复用补丁② 的 429 自动重试）
+          try {
+            const r = await fetchTelegramWithRetry(
+              `${config.tgApiBase}/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgChatId}&message_id=${file.message_id}`,
+            );
+            if (!r.ok) {
+              const e = await r.json().catch(() => ({}));
+              const desc = (e && e.description) || "";
+              if (!desc.includes("message to delete not found")) msg = desc || "Telegram 删除失败";
+            }
+          } catch (e) {
+            msg = e.message;
+          }
+          // 无论 Telegram 是否成功，都清掉数据库记录
+          await config.database.prepare("DELETE FROM files WHERE url = ? OR webp_url = ?").bind(url, url).run();
+          // 顺手清理边缘缓存，让删除立即生效
+          try {
+            const cache = caches.default;
+            await cache.delete(new Request(url));
+            if (file.webp_url) await cache.delete(new Request(file.webp_url));
+          } catch {}
+          ok = true;
+        }
+      } catch (e) {
+        msg = e.message;
+      }
+      results.push({ url, ok, msg: msg || undefined });
+      if (i < list.length - 1) await new Promise((r) => setTimeout(r, 150));
+    }
+    return new Response(
+      JSON.stringify({
+        success: true,
+        total: list.length,
+        deleted: results.filter((r) => r.ok).length,
+        results,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  } catch (error) {
+    console.error("[error] Batch delete failed:", error);
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
 // 处理文件删除
 async function handleDeleteRequest(request, config) {
   try {
@@ -664,6 +744,8 @@ async function handleDeleteRequest(request, config) {
 
     // 删除数据库表数据，即使Telegram删除失败也会删除数据库记录
     await config.database.prepare("DELETE FROM files WHERE url = ? OR webp_url = ?").bind(url, url).run();
+    // 【补丁④】顺手清理边缘缓存，让删除立即生效
+    try { await caches.default.delete(new Request(url)); } catch {}
     return new Response(
       JSON.stringify({
         success: true,
@@ -1288,12 +1370,16 @@ function generateUploadPage() {
 
       // 统一文件处理函数：负责校验和启动上传
       async function processFiles(files) {
+        let isFirst = true; // 【补丁③】串行上传用
         for (let file of files) {
           if (!file) continue;
           if (file.size > globalConfig.maxSizeMB * 1024 * 1024) {
             await showAlert(\`文件 "\${file.name || '粘贴的文件'}" 超过 \${globalConfig.maxSizeMB}MB 限制\`, '文件过大', 'warning');
             continue;
           } // 校验大小
+          // 【补丁③】每张之间至少间隔 3.3 秒，避免触发 Telegram「同一频道每分钟 20 条」限制
+          if (!isFirst) await new Promise((r) => setTimeout(r, 3300));
+          isFirst = false;
           await uploadFile(file);
         }
       }
@@ -1338,6 +1424,8 @@ function generateUploadPage() {
         previewArea.appendChild(preview);
         previewArea.style.display = 'block';
 
+        // 【补丁③】把本次上传包成 Promise —— 原代码发完 XHR 就返回，导致 await 形同虚设、所有文件并发上传
+        return new Promise((resolve) => {
         const xhr = new XMLHttpRequest();
         const progressTrack = preview.querySelector('.progress-track');
         const progressText = preview.querySelector('.progress-text');
@@ -1376,12 +1464,21 @@ function generateUploadPage() {
             preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
             preview.classList.add('error');
           }
+          resolve(); // 【补丁③】本次上传结束，放行队列
         });
 
         const formData = new FormData();
         formData.append('file', file);
+        // 【补丁③】网络错误 / 中断也要放行队列，否则后面的文件会被卡死
+        xhr.addEventListener('error', () => {
+          preview.querySelector('.progress-text').textContent = '✗ 网络错误';
+          preview.classList.add('error');
+          resolve();
+        });
+        xhr.addEventListener('abort', () => resolve());
         xhr.open('POST', '/upload');
         xhr.send(formData);
+        });
       }
 
       // 创建文件预览：负责显示文件信息、进度条、清除按钮
@@ -1671,6 +1768,31 @@ function generateAdminPage(fileCards, qrModal) {
       .btn-copy { background: #007bff; color: white; }
       .btn-down { background: #3c9144; color: white; text-decoration: none; }
 
+      /* 【补丁④】批量删除相关样式 */
+      .batch-bar {
+        display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+        margin: 0 0 18px; padding: 10px 14px;
+        background: rgba(255,255,255,0.5); backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        font-size: 14px;
+      }
+      .batch-bar label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+      .batch-bar input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; margin: 0; }
+      .batch-count { font-weight: 600; color: #333; }
+      .batch-hint { color: #888; font-size: 12px; margin-left: auto; }
+      .batch-bar .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+      .batch-clear { background: rgba(0,0,0,0.08); color: #444; }
+      .card-pick {
+        position: absolute; top: 8px; left: 8px; z-index: 5;
+        display: flex; align-items: center; justify-content: center;
+        width: 26px; height: 26px; border-radius: 6px;
+        background: rgba(255,255,255,0.9); box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+        cursor: pointer;
+      }
+      .card-pick input { width: 16px; height: 16px; cursor: pointer; margin: 0; }
+      .file-card.selected { outline: 3px solid #dc3545; outline-offset: -3px; }
+
       .qr-modal {
         display: none;
         position: fixed;
@@ -1823,6 +1945,14 @@ function generateAdminPage(fileCards, qrModal) {
           <input type="text" class="search" placeholder="搜索文件..." id="searchInput">
         </div>
       </div>
+      <!-- 【补丁④】批量删除操作栏 -->
+      <div class="batch-bar">
+        <label class="batch-all"><input type="checkbox" id="selectAllCheck"> 全选本页</label>
+        <span id="batchCount" class="batch-count">已选 0 项</span>
+        <button class="btn btn-delete" id="batchDeleteBtn" disabled><i class="fas fa-trash"></i> 批量删除所选</button>
+        <button class="btn batch-clear" id="batchClearBtn"><i class="fas fa-xmark"></i> 取消选择</button>
+        <span class="batch-hint">提示：一次最多 100 个</span>
+      </div>
       <div class="grid" id="fileGrid">
         ${fileCards}
       </div>
@@ -1877,6 +2007,7 @@ function generateAdminPage(fileCards, qrModal) {
         fileCards.forEach(c => c.style.display = 'none');
         filteredCards.slice(start, end).forEach(c => c.style.display = '');
         renderPagination(totalPages);
+        updateBatchUI(); // 【补丁④】同步批量选择状态
       }
     
       function renderPagination(totalPages) {
@@ -1963,6 +2094,89 @@ function generateAdminPage(fileCards, qrModal) {
         }
       }
     
+      // -------------------- 【补丁④】批量删除 --------------------
+      const batchCountEl = document.getElementById('batchCount');
+      const batchDeleteBtn = document.getElementById('batchDeleteBtn');
+      const batchClearBtn = document.getElementById('batchClearBtn');
+      const selectAllCheck = document.getElementById('selectAllCheck');
+
+      function getCheckedUrls() {
+        return Array.from(document.querySelectorAll('.card-check:checked')).map(function (c) { return c.getAttribute('data-check'); });
+      }
+      function getVisibleChecks() {
+        return getFilteredCards()
+          .slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage)
+          .map(function (card) { return card.querySelector('.card-check'); })
+          .filter(Boolean);
+      }
+      function updateBatchUI() {
+        if (!batchCountEl) return;
+        const n = getCheckedUrls().length;
+        batchCountEl.textContent = '已选 ' + n + ' 项';
+        if (batchDeleteBtn) batchDeleteBtn.disabled = n === 0;
+        const vis = getVisibleChecks();
+        const checkedVis = vis.filter(function (c) { return c.checked; }).length;
+        if (selectAllCheck) {
+          selectAllCheck.checked = vis.length > 0 && checkedVis === vis.length;
+          selectAllCheck.indeterminate = checkedVis > 0 && checkedVis < vis.length;
+        }
+        document.querySelectorAll('.file-card').forEach(function (card) {
+          const cb = card.querySelector('.card-check');
+          card.classList.toggle('selected', !!(cb && cb.checked));
+        });
+      }
+      document.addEventListener('change', function (e) {
+        if (e.target && e.target.classList && e.target.classList.contains('card-check')) updateBatchUI();
+      });
+      if (selectAllCheck) {
+        selectAllCheck.addEventListener('change', function () {
+          const on = selectAllCheck.checked;
+          getVisibleChecks().forEach(function (c) { c.checked = on; });
+          updateBatchUI();
+        });
+      }
+      if (batchClearBtn) {
+        batchClearBtn.addEventListener('click', function () {
+          document.querySelectorAll('.card-check').forEach(function (c) { c.checked = false; });
+          updateBatchUI();
+        });
+      }
+      if (batchDeleteBtn) {
+        batchDeleteBtn.addEventListener('click', async function () {
+          const urls = getCheckedUrls();
+          if (urls.length === 0) return;
+          const okConfirm = await showConfirm('确定要删除选中的 ' + urls.length + ' 个文件吗？此操作不可撤销。', '批量删除确认');
+          if (!okConfirm) return;
+          const original = batchDeleteBtn.innerHTML;
+          batchDeleteBtn.disabled = true;
+          batchDeleteBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 删除中...';
+          try {
+            const resp = await fetch('/delete-batch', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ urls: urls })
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || '批量删除失败');
+            const okSet = {};
+            (data.results || []).forEach(function (r) { if (r.ok) okSet[r.url] = true; });
+            document.querySelectorAll('.file-card').forEach(function (card) {
+              if (okSet[card.getAttribute('data-url')]) card.remove();
+            });
+            fileCards = Array.from(fileGrid.children);
+            renderPage(currentPage);
+            updateBatchUI();
+            const failList = (data.results || []).filter(function (r) { return !r.ok; });
+            await showAlert('批量删除完成：成功 ' + data.deleted + ' / ' + data.total + ' 个' + (failList.length ? '（失败 ' + failList.length + ' 个，详见控制台）' : ''), '批量删除', failList.length ? 'warning' : 'success');
+            if (failList.length) console.warn('批量删除失败明细:', failList);
+          } catch (err) {
+            await showAlert('批量删除失败: ' + err.message, '删除失败', 'error');
+          } finally {
+            batchDeleteBtn.innerHTML = original;
+            updateBatchUI();
+          }
+        });
+      }
       // -------------------- 初始渲染 --------------------
       renderPage(currentPage);
 
