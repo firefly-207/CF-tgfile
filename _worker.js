@@ -59,7 +59,7 @@ export default {
     const { pathname } = new URL(request.url);
 
     // 统一认证检查
-    const publicRoutes = ["/config"];
+    const publicRoutes = ["/config", "/tg-upload"]; // 【补丁⑨】/tg-upload 需要在 handler 里自行鉴权（否则 CORS 预检会被 302 拦掉）
     const authRoutes = ["/", "/login"];
     const isFileRequest = /\/([\p{L}\p{N}_.%-]+)\.[a-z0-9]+$/iu.test(pathname);
 
@@ -86,6 +86,7 @@ export default {
       "/delete": () => handleDeleteRequest(request, config),
       "/delete-batch": () => handleBatchDeleteRequest(request, config), // 【补丁④】批量删除
       "/hide": () => handleHideRequest(request, config), // 【补丁⑧】隐藏 / 取消隐藏
+      "/tg-upload": () => handleTgUploadRequest(request, config), // 【补丁⑨】Telegraph 上传中转
       "/search": () => handleSearchRequest(request, config),
     };
     const handler = routes[pathname];
@@ -481,6 +482,43 @@ async function handleUploadRequest(request, config) {
   }
 }
 
+// 【补丁⑨】Telegraph 上传中转
+// 为什么要它：浏览器页面直接 POST https://telegra.ph/upload 会返回 400 "Unknown error"
+//（实测「字段名 file/photo × 凭据 omit/same-origin」四种组合全部失败）——
+// Telegraph 不接受来自网页脚本的调用；改由 Worker 从服务端转发即可（同类项目都这么做）。
+async function handleTgUploadRequest(request, config) {
+  const cors = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Max-Age": "86400",
+  };
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  const withCors = (obj, status) =>
+    new Response(JSON.stringify(obj), {
+      status: status,
+      headers: Object.assign({ "Content-Type": "application/json" }, cors),
+    });
+  try {
+    const token = String(request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    if (token !== config.apiToken) {
+      return withCors({ ok: false, error: "未授权：请在脚本面板里填写正确的 API_TOKEN" }, 401);
+    }
+    const inFd = await request.formData();
+    const file = inFd.get("file");
+    if (!file || typeof file === "string") {
+      return withCors({ ok: false, error: "没有收到文件（表单字段名应为 file）" }, 400);
+    }
+    const outFd = new FormData();
+    outFd.append("file", file, file.name || "image.jpg");
+    const up = await fetch("https://telegra.ph/upload", { method: "POST", body: outFd });
+    const txt = await up.text();
+    return withCors({ ok: up.ok, status: up.status, body: txt }, 200);
+  } catch (error) {
+    console.error("[error] tg-upload proxy failed:", error);
+    return withCors({ ok: false, error: error.message }, 500);
+  }
+}
 // 【补丁⑧】隐藏 / 取消隐藏
 // 只改 D1 里的一个标记：记录主体和 Telegram 消息都保留 => 链接永久有效
 async function handleHideRequest(request, config) {
