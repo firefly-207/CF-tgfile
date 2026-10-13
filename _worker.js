@@ -303,18 +303,42 @@ async function handleUploadRequest(request, config) {
       field = "document";
     }
 
-    const tgFormData = new FormData();
-    tgFormData.append("chat_id", config.tgChatId);
-    tgFormData.append(field, file, file.name);
-    // 【补丁 2026-10-12】改用带 429 自动重试的调用
-    const tgResponse = await fetchTelegramWithRetry(`${config.tgApiBase}/bot${config.tgBotToken}/${method}`, {
-      method: "POST",
-      body: tgFormData,
-    });
+    // 【补丁⑥】图片优先用 sendPhoto；若因大小/尺寸被拒，自动降级为 sendDocument
+    //   sendPhoto  限制：<= 10MB，且 宽+高 <= 10000（超长截图会失败）
+    //   sendDocument 限制：<= 50MB，且不做照片压缩
+    const sendToTelegram = async (m, f) => {
+      const fd = new FormData();
+      fd.append("chat_id", config.tgChatId);
+      fd.append(f, file, file.name);
+      return await fetchTelegramWithRetry(`${config.tgApiBase}/bot${config.tgBotToken}/${m}`, {
+        method: "POST",
+        body: fd,
+      });
+    };
+    const isImageUpload = mainType === "image";
+    const SEND_PHOTO_MAX = 9.5 * 1024 * 1024; // 留 0.5MB 余量
+    let useMethod = method;
+    let useField = field;
+    if (isImageUpload && file.size > SEND_PHOTO_MAX) {
+      useMethod = "sendDocument";
+      useField = "document";
+      console.log(`[info] 图片 ${(file.size / 1024 / 1024).toFixed(1)}MB 超过 sendPhoto 上限，改用 sendDocument`);
+    }
+    let tgResponse = await sendToTelegram(useMethod, useField);
+    // 兜底：sendPhoto 被拒（尺寸过大 / 格式不支持）时，自动改走文档方式再试一次
+    if (!tgResponse.ok && isImageUpload && useMethod === "sendPhoto" && tgResponse.status === 400) {
+      const firstErr = await tgResponse.text();
+      console.error("[warn] sendPhoto 被拒，改用 sendDocument 重试:", firstErr);
+      tgResponse = await sendToTelegram("sendDocument", "document");
+      useMethod = "sendDocument";
+    }
     if (!tgResponse.ok) {
       const errorText = await tgResponse.text();
       if (tgResponse.status === 429) {
         throw new Error(`Telegram 限流（429）—— 同一频道约每分钟最多 20 条消息，请等 1 分钟再传、或一次少传几张。原始信息: ${errorText}`);
+      }
+      if (isImageUpload) {
+        throw new Error(`Telegram 拒绝了这张图片（状态码: ${tgResponse.status}）—— 可能超过 10MB 或尺寸过大（宽+高 > 10000）。原始信息: ${errorText}`);
       }
       throw new Error(`Telegram API调用失败 (状态码: ${tgResponse.status}): ${errorText}`);
     }
