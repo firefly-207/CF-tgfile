@@ -578,7 +578,7 @@ async function handleAdminRequest(request, config) {
     </div>
   `;
 
-    const html = generateAdminPage(fileCards, qrModal);
+    const html = generateAdminPage(fileCards, qrModal, showHidden); // 【补丁⑧修复】
     return new Response(html, {
       headers: { "Content-Type": "text/html;charset=UTF-8" },
     });
@@ -1704,7 +1704,7 @@ function generateUploadPage() {
 }
 
 // 生成文件管理页面 /admin
-function generateAdminPage(fileCards, qrModal) {
+function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修复】需要知道当前是否在「显示已隐藏」视图
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
