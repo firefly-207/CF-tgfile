@@ -1370,6 +1370,11 @@ function generateUploadPage() {
 
       // 统一文件处理函数：负责校验和启动上传
       async function processFiles(files) {
+        // 【补丁⑤】先按文件名自然排序，保证上传顺序 = 文件名顺序
+        // 不再依赖文件对话框的排序（数字按数值比较：1,2,...,9,10,11，而不是 11,12,...,1,10）
+        files = Array.from(files).sort(function (a, b) {
+          return String(a.name).localeCompare(String(b.name), 'zh-CN', { numeric: true, sensitivity: 'base' });
+        });
         let isFirst = true; // 【补丁③】串行上传用
         for (let file of files) {
           if (!file) continue;
