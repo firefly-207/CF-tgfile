@@ -27,6 +27,19 @@ async function initDatabase(config) {
     } catch (e) {
       // 列已存在，忽略
     }
+    // 【补丁⑪】文件夹功能：给 files 补一列「所属文件夹」，再建两张新表
+    //   folder     ："旅行" 或 "文章/2026/11" 这样的路径；空字符串 = 未分类（根目录）
+    //   folders    ：记录所有文件夹（含空文件夹，否则建了空文件夹就看不见）
+    //   redirects  ：图片被移动/重命名后，老地址 → 新地址 的跳转记录，保证已发布的文章不会挂
+    try {
+      await config.database.prepare("ALTER TABLE files ADD COLUMN folder TEXT DEFAULT ''").run();
+    } catch (e) {
+      // 列已存在，忽略
+    }
+    await config.database.prepare("CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, created_at INTEGER NOT NULL)").run();
+    await config.database
+      .prepare("CREATE TABLE IF NOT EXISTS redirects (old_url TEXT PRIMARY KEY, new_url TEXT NOT NULL, created_at INTEGER NOT NULL)")
+      .run();
     isDatabaseInitialized = true;
   } catch (error) {
     console.error("[error] Database initialization failed:", error);
@@ -61,10 +74,13 @@ export default {
     // 统一认证检查
     const publicRoutes = ["/config", "/tg-upload"]; // 【补丁⑨】/tg-upload 需要在 handler 里自行鉴权（否则 CORS 预检会被 302 拦掉）
     const authRoutes = ["/", "/login"];
-    const isFileRequest = /\/([\p{L}\p{N}_.%-]+)\.[a-z0-9]+$/iu.test(pathname);
+    // 【补丁⑪】图片地址现在可以带文件夹路径（如 /旅行/001-1791xxx.jpg），所以放开多段路径
+    const isFileRequest = /\/(?:[\p{L}\p{N}_.%-]+\/)*[\p{L}\p{N}_.%-]+\.[a-z0-9]+$/iu.test(pathname);
+    // 【补丁⑪】以 / 结尾的地址 = 文件夹浏览页（带尾斜杠），公开可访问，方便把整个文件夹分享出去
+    const isFolderPage = pathname.length > 1 && pathname.endsWith("/");
 
     if (config.enableAuth) {
-      if (!publicRoutes.includes(pathname) && !authRoutes.includes(pathname) && !isFileRequest) {
+      if (!publicRoutes.includes(pathname) && !authRoutes.includes(pathname) && !isFileRequest && !isFolderPage) {
         if (!authenticate(request, config)) {
           return Response.redirect(`${new URL(request.url).origin}/`, 302);
         }
@@ -88,9 +104,14 @@ export default {
       "/hide": () => handleHideRequest(request, config), // 【补丁⑧】隐藏 / 取消隐藏
       "/tg-upload": () => handleTgUploadRequest(request, config), // 【补丁⑨】Telegraph 上传中转
       "/search": () => handleSearchRequest(request, config),
+      "/folders": () => handleFoldersRequest(request, config), // 【补丁⑪】文件夹：列表 / 新建 / 重命名 / 删除
+      "/move-files": () => handleMoveFilesRequest(request, config), // 【补丁⑪】把图片移动到文件夹
     };
     const handler = routes[pathname];
     if (handler) return await handler();
+
+    // 【补丁⑪】文件夹浏览页：/<文件夹路径>/
+    if (isFolderPage) return await handleFolderPageRequest(request, config);
 
     // 处理文件访问请求
     return await handleFileRequest(request, config);
@@ -283,6 +304,99 @@ async function fetchTelegramWithRetry(url, options, maxRetry = 3, totalBudgetSec
   }
 }
 
+// ==================== 【补丁⑪】文件夹相关的公共小工具 ====================
+// 规范化文件夹路径：去首尾斜杠、合并连续斜杠、拒绝 . 和 ..、长度上限 200
+// 返回 { ok, path } 或 { ok:false, error }
+function normalizeFolderPath(input) {
+  if (input === undefined || input === null) return { ok: true, path: "" };
+  const s = String(input)
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!s) return { ok: true, path: "" };
+  for (const seg of s.split("/")) {
+    if (!seg || seg === "." || seg === "..") return { ok: false, error: "文件夹名不能为空，也不能是 . 或 .." };
+  }
+  if (s.length > 200) return { ok: false, error: "文件夹路径太长（最多 200 个字符）" };
+  return { ok: true, path: s };
+}
+
+// 文件夹路径 → URL 里那一段（逐段百分号编码，中文文件夹名才不会出错）
+function encodeFolderPath(path) {
+  if (!path) return "";
+  return path.split("/").map(encodeURIComponent).join("/") + "/";
+}
+
+// 拼出图片的完整地址
+function buildFileUrl(config, folderPath, fileName) {
+  return `https://${config.domain}/${encodeFolderPath(folderPath)}${fileName}`;
+}
+
+// 从一个完整地址里取出「文件名」部分（已经是编码过的，原样保留）
+function fileNameFromUrl(url) {
+  const s = String(url);
+  const i = s.lastIndexOf("/");
+  return i === -1 ? s : s.slice(i + 1);
+}
+
+// 文件夹路径 → 用于 LIKE 前缀匹配的转义串（% _ ! 都要转义，配合 ESCAPE '!'）
+function likePrefix(path) {
+  return (
+    String(path)
+      .replace(/!/g, "!!")
+      .replace(/%/g, "!%")
+      .replace(/_/g, "!_") + "/%"
+  );
+}
+
+// HTML 转义（文件夹页会显示用户自己起的名字）
+function escapeHtml(s) {
+  return String(s === undefined || s === null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// 把某条路径沿途的所有层级都登记进 folders 表
+//   「文章/2026/11」→ 同时登记 文章、文章/2026、文章/2026/11
+//   这样后台的文件夹列表是一棵完整的树，中间层也能点进去
+async function ensureFolderChain(config, path) {
+  if (!path) return;
+  const segs = String(path).split("/");
+  for (let i = 1; i <= segs.length; i++) {
+    const p = segs.slice(0, i).join("/");
+    await config.database.prepare("INSERT OR IGNORE INTO folders (path, created_at) VALUES (?, ?)").bind(p, Date.now()).run();
+  }
+}
+
+// 列出所有文件夹 + 各自的图片数量（只统计未隐藏的）
+async function loadFolderList(config) {
+  const folders = (await config.database.prepare("SELECT path FROM folders ORDER BY path").all()).results || [];
+  const counts =
+    (await config.database
+      .prepare("SELECT COALESCE(folder, '') AS f, COUNT(*) AS c FROM files WHERE COALESCE(hidden, 0) = 0 GROUP BY COALESCE(folder, '')")
+      .all()).results || [];
+  const countMap = {};
+  let uncategorized = 0;
+  for (const row of counts) {
+    const key = row.f || "";
+    if (key === "") uncategorized = Number(row.c) || 0;
+    else countMap[key] = Number(row.c) || 0;
+  }
+  // 只出现在 files 里、没登记进 folders 表的路径也一起显示（老数据兜底）
+  const paths = new Set(folders.map((f) => f.path));
+  for (const k of Object.keys(countMap)) paths.add(k);
+  const list = Array.from(paths).sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true }));
+  return {
+    folders: list.map((p) => ({ path: p, count: countMap[p] || 0, depth: p.split("/").length - 1 })),
+    uncategorized,
+    total: list.reduce((acc, p) => acc + (countMap[p] || 0), 0) + uncategorized,
+  };
+}
+
 // 处理文件上传
 async function handleUploadRequest(request, config) {
   if (request.method === "GET") {
@@ -297,6 +411,11 @@ async function handleUploadRequest(request, config) {
     const file = formData.get("file");
     if (!file) throw new Error("未找到文件");
     if (file.size > config.maxSizeMB * 1024 * 1024) throw new Error(`文件超过${config.maxSizeMB}MB限制`);
+
+    // 【补丁⑪】上传时可以指定文件夹（上传页的下拉框；不填 = 未分类）
+    const folderResult = normalizeFolderPath(formData.get("folder"));
+    if (!folderResult.ok) throw new Error(folderResult.error);
+    const folderPath = folderResult.path;
 
     const ext = (file.name.split(".").pop() || "").toLowerCase(); //获取文件扩展名
     const [mainType] = file.type.split("/"); // 获取文件主类型
@@ -420,7 +539,12 @@ async function handleUploadRequest(request, config) {
       const mimeExt = MIME_EXT[String(file.type || "").toLowerCase()] || (ext && ext !== rawName ? ext : "") || "bin";
       safeName = `${rawName ? encodeURIComponent(rawName) + "-" : ""}${time}.${mimeExt}`;
     }
-    originalUrl = `https://${config.domain}/${safeName}`;
+    originalUrl = buildFileUrl(config, folderPath, safeName); // 【补丁⑪】带文件夹路径
+
+    // 【补丁⑪】上传到还不存在的文件夹时自动登记（连中间层一起，否则后台列表里看不到）
+    if (folderPath) {
+      await ensureFolderChain(config, folderPath);
+    }
 
     // 同名覆盖：url 是主键(PRIMARY KEY)，必须先删旧记录，否则 INSERT 会失败
     {
@@ -442,7 +566,7 @@ async function handleUploadRequest(request, config) {
         } catch {}
       }
     }
-    const webpUrl = useWebpMode ? `https://${config.domain}/${time}.webp` : null;
+    const webpUrl = useWebpMode ? `https://${config.domain}/${encodeFolderPath(folderPath)}${time}.webp` : null; // 【补丁⑪】同样带文件夹路径
     const finalUrl = useWebpMode ? webpUrl : originalUrl;
     const webpFileName = useWebpMode ? file.name.replace(/\.[^/.]+$/, ".webp") : null;
     const finalFileName = useWebpMode ? webpFileName : file.name;
@@ -450,11 +574,11 @@ async function handleUploadRequest(request, config) {
     await config.database
       .prepare(
         `
-      INSERT INTO files (url, webp_url, fileId, message_id, created_at, file_name, webp_file_name, file_size, mime_type)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files (url, webp_url, fileId, message_id, created_at, file_name, webp_file_name, file_size, mime_type, folder)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
       )
-      .bind(originalUrl, webpUrl, fileId, messageId, timestamp, file.name, webpFileName, file.size, file.type)
+      .bind(originalUrl, webpUrl, fileId, messageId, timestamp, file.name, webpFileName, file.size, file.type, folderPath)
       .run();
 
     // 方案A优化版：webp 预转换，测量准确大小并预热缓存
@@ -581,21 +705,447 @@ async function handleHideRequest(request, config) {
     });
   }
 }
+// ==================== 【补丁⑪】文件夹：后端处理 ====================
+// 清掉某个地址的边缘缓存（搬家后新旧地址都要清）
+async function purgeCache(url) {
+  try {
+    await caches.default.delete(new Request(url));
+  } catch {}
+}
+
+// 把某个文件夹（含子文件夹）下的图片整体搬家
+//   oldPrefix ：原文件夹路径
+//   newPath   ：新文件夹路径；空字符串表示「未分类」
+//   keepSub   ：true = 保留子文件夹结构（重命名用）；false = 全部并到 newPath（删除文件夹时全部回未分类）
+// 返回 [{ oldUrl, newUrl, ok, msg }]
+async function relocateFiles(config, oldPrefix, newPath, keepSub) {
+  const rows =
+    (await config.database
+      .prepare("SELECT url, folder, file_name FROM files WHERE folder = ? OR folder LIKE ? ESCAPE '!'")
+      .bind(oldPrefix, likePrefix(oldPrefix))
+      .all()).results || [];
+  const out = [];
+  for (const row of rows) {
+    const oldUrl = row.url;
+    const folder = row.folder || "";
+    let targetFolder;
+    if (!keepSub) targetFolder = newPath;
+    else if (folder === oldPrefix) targetFolder = newPath;
+    else targetFolder = newPath ? newPath + "/" + folder.slice(oldPrefix.length + 1) : folder.slice(oldPrefix.length + 1);
+    const newUrl = buildFileUrl(config, targetFolder, fileNameFromUrl(oldUrl));
+    if (newUrl === oldUrl) {
+      out.push({ oldUrl, newUrl, ok: true, msg: "地址未变化" });
+      continue;
+    }
+    try {
+      const clash = await config.database.prepare("SELECT url FROM files WHERE url = ?").bind(newUrl).first();
+      if (clash) {
+        out.push({ oldUrl, newUrl, ok: false, msg: "目标位置已有同名文件，已跳过" });
+        continue;
+      }
+      await config.database
+        .prepare("INSERT OR REPLACE INTO redirects (old_url, new_url, created_at) VALUES (?, ?, ?)")
+        .bind(oldUrl, newUrl, Date.now())
+        .run();
+      await config.database.prepare("UPDATE files SET url = ?, folder = ? WHERE url = ?").bind(newUrl, targetFolder, oldUrl).run();
+      await purgeCache(oldUrl);
+      await purgeCache(newUrl);
+      out.push({ oldUrl, newUrl, ok: true });
+    } catch (e) {
+      out.push({ oldUrl, newUrl, ok: false, msg: e.message });
+    }
+  }
+  return out;
+}
+
+// 【补丁⑪】文件夹接口：GET 列表；POST { action: create | rename | delete }
+async function handleFoldersRequest(request, config) {
+  const reply = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+  try {
+    if (request.method === "GET") {
+      const data = await loadFolderList(config);
+      return reply({ success: true, folders: data.folders, uncategorized: data.uncategorized, total: data.total });
+    }
+
+    const body = await request.json();
+    const action = String(body.action || "");
+
+    if (action === "create") {
+      const n = normalizeFolderPath(body.path);
+      if (!n.ok) return reply({ error: n.error }, 400);
+      if (!n.path) return reply({ error: "文件夹名不能为空" }, 400);
+      const exists = await config.database.prepare("SELECT path FROM folders WHERE path = ?").bind(n.path).first();
+      if (exists) return reply({ error: "文件夹「" + n.path + "」已经存在" }, 400);
+      await config.database.prepare("INSERT INTO folders (path, created_at) VALUES (?, ?)").bind(n.path, Date.now()).run();
+      await ensureFolderChain(config, n.path); // 【补丁⑪】中间层也一起登记
+      const data = await loadFolderList(config);
+      return reply({ success: true, path: n.path, folders: data.folders, uncategorized: data.uncategorized, total: data.total });
+    }
+
+    if (action === "rename") {
+      const o = normalizeFolderPath(body.old);
+      const n = normalizeFolderPath(body.new);
+      if (!o.ok) return reply({ error: o.error }, 400);
+      if (!n.ok) return reply({ error: n.error }, 400);
+      if (!o.path || !n.path) return reply({ error: "不能把文件夹改成空路径" }, 400);
+      if (o.path === n.path) return reply({ error: "新旧名字一模一样" }, 400);
+      if (n.path.startsWith(o.path + "/")) return reply({ error: "不能把文件夹移动到自己里面" }, 400);
+      const oldRow = await config.database.prepare("SELECT path FROM folders WHERE path = ?").bind(o.path).first();
+      if (!oldRow) return reply({ error: "文件夹不存在" }, 400);
+      const dup = await config.database.prepare("SELECT path FROM folders WHERE path = ?").bind(n.path).first();
+      if (dup) return reply({ error: "已经有一个叫「" + n.path + "」的文件夹了" }, 400);
+      // 【补丁⑪】新路径的「中间层」要先存在（例如 旅行 → 文章/旅行，需要先有「文章」）
+      //   注意：只登记中间层，最后一段留给下面的改名语句去产生 —— 否则会和主键撞车
+      const newSegs = n.path.split("/");
+      if (newSegs.length > 1) await ensureFolderChain(config, newSegs.slice(0, -1).join("/"));
+      const affected =
+        (await config.database.prepare("SELECT path FROM folders WHERE path = ? OR path LIKE ? ESCAPE '!'").bind(o.path, likePrefix(o.path)).all()).results || [];
+      for (const row of affected) {
+        const np = n.path + row.path.slice(o.path.length);
+        await config.database.prepare("UPDATE folders SET path = ? WHERE path = ?").bind(np, row.path).run();
+      }
+      const moved = await relocateFiles(config, o.path, n.path, true);
+      const data = await loadFolderList(config);
+      return reply({
+        success: true,
+        old: o.path,
+        new: n.path,
+        files: moved.filter((m) => m.ok).length,
+        failed: moved.filter((m) => !m.ok),
+        folders: data.folders,
+        uncategorized: data.uncategorized,
+        total: data.total,
+      });
+    }
+
+    if (action === "delete") {
+      const d = normalizeFolderPath(body.path);
+      if (!d.ok) return reply({ error: d.error }, 400);
+      if (!d.path) return reply({ error: "不能删除根目录" }, 400);
+      // 里面的图片（含子文件夹里的）全部回到「未分类」，图片本身不删
+      const moved = await relocateFiles(config, d.path, "", false);
+      await config.database.prepare("DELETE FROM folders WHERE path = ? OR path LIKE ? ESCAPE '!'").bind(d.path, likePrefix(d.path)).run();
+      const data = await loadFolderList(config);
+      return reply({
+        success: true,
+        deleted: d.path,
+        files: moved.filter((m) => m.ok).length,
+        failed: moved.filter((m) => !m.ok),
+        folders: data.folders,
+        uncategorized: data.uncategorized,
+        total: data.total,
+      });
+    }
+
+    return reply({ error: "未知操作：" + action }, 400);
+  } catch (error) {
+    console.error("[error] Folders request failed:", error);
+    return reply({ error: error.message }, 500);
+  }
+}
+
+// 【补丁⑪】把勾选的图片移动到某个文件夹
+async function handleMoveFilesRequest(request, config) {
+  const reply = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+  try {
+    const body = await request.json();
+    const urls = Array.isArray(body.urls) ? body.urls.filter((u) => typeof u === "string") : [];
+    if (urls.length === 0) return reply({ error: "请先勾选要移动的图片" }, 400);
+    if (urls.length > 100) return reply({ error: "一次最多移动 100 个文件，请分批操作（当前 " + urls.length + " 个）" }, 400);
+    const n = normalizeFolderPath(body.folder);
+    if (!n.ok) return reply({ error: n.error }, 400);
+    const target = n.path;
+    if (target) {
+      const exists = await config.database.prepare("SELECT path FROM folders WHERE path = ?").bind(target).first();
+      if (!exists) return reply({ error: "文件夹「" + target + "」不存在，请先创建" }, 400);
+    }
+    const results = [];
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      try {
+        const file = await config.database.prepare("SELECT url, folder, file_name FROM files WHERE url = ? OR webp_url = ?").bind(url, url).first();
+        if (!file) {
+          results.push({ url, ok: false, msg: "数据库中无此记录" });
+        } else {
+          const newUrl = buildFileUrl(config, target, fileNameFromUrl(file.url));
+          if (newUrl === file.url) {
+            results.push({ url, ok: true, unchanged: true });
+          } else {
+            const clash = await config.database.prepare("SELECT url FROM files WHERE url = ?").bind(newUrl).first();
+            if (clash) {
+              results.push({ url, ok: false, msg: "目标文件夹里已经有同名文件：" + fileNameFromUrl(newUrl) });
+            } else {
+              await config.database
+                .prepare("INSERT OR REPLACE INTO redirects (old_url, new_url, created_at) VALUES (?, ?, ?)")
+                .bind(file.url, newUrl, Date.now())
+                .run();
+              await config.database.prepare("UPDATE files SET url = ?, folder = ? WHERE url = ?").bind(newUrl, target, file.url).run();
+              await purgeCache(file.url);
+              await purgeCache(newUrl);
+              results.push({ url, ok: true, newUrl });
+            }
+          }
+        }
+      } catch (e) {
+        results.push({ url, ok: false, msg: e.message });
+      }
+      if (i < urls.length - 1) await new Promise((r) => setTimeout(r, 50));
+    }
+    const data = await loadFolderList(config);
+    return reply({
+      success: true,
+      total: urls.length,
+      moved: results.filter((r) => r.ok).length,
+      results,
+      folders: data.folders,
+      uncategorized: data.uncategorized,
+      count: data.total,
+    });
+  } catch (error) {
+    console.error("[error] Move files failed:", error);
+    return reply({ error: error.message }, 500);
+  }
+}
+
+// 【补丁⑪】公开的文件夹浏览页：/<文件夹路径>/
+async function handleFolderPageRequest(request, config) {
+  try {
+    const pathname = new URL(request.url).pathname;
+    let raw = pathname.replace(/^\/+|\/+$/g, "");
+    try {
+      raw = decodeURIComponent(raw);
+    } catch {}
+    const n = normalizeFolderPath(raw);
+    if (!n.ok || !n.path) return new Response("文件夹不存在", { status: 404, headers: { "Content-Type": "text/plain;charset=UTF-8" } });
+    const folder = n.path;
+    const folderRow = await config.database.prepare("SELECT path FROM folders WHERE path = ?").bind(folder).first();
+    const files =
+      (await config.database
+        .prepare(
+          "SELECT url, file_name, file_size, mime_type FROM files WHERE COALESCE(folder, '') = ? AND COALESCE(hidden, 0) = 0 ORDER BY file_name COLLATE NOCASE",
+        )
+        .bind(folder)
+        .all()).results || [];
+    if (!folderRow && files.length === 0) {
+      return new Response("文件夹不存在", { status: 404, headers: { "Content-Type": "text/plain;charset=UTF-8" } });
+    }
+    // 直接子文件夹：folders 表 + 实际有图的路径，两处合并（取第一层）
+    const prefix = likePrefix(folder);
+    const subRows =
+      (await config.database.prepare("SELECT path FROM folders WHERE path LIKE ? ESCAPE '!'").bind(prefix).all()).results || [];
+    const subFileRows =
+      (await config.database.prepare("SELECT DISTINCT folder FROM files WHERE COALESCE(hidden, 0) = 0 AND folder LIKE ? ESCAPE '!'").bind(prefix).all()).results || [];
+    const direct = new Set();
+    for (const r of subRows.concat(subFileRows)) {
+      const rest = String(r.path || r.folder || "").slice(folder.length + 1);
+      const first = rest.split("/")[0];
+      if (first) direct.add(first);
+    }
+    const subs = Array.from(direct).sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true })).map((name) => ({ name: name, path: folder + "/" + name }));
+    return new Response(generateFolderPage(config, folder, files, subs), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+  } catch (error) {
+    console.error("[error] Folder page failed:", error);
+    return new Response("服务器内部错误: " + error.message, { status: 500, headers: { "Content-Type": "text/plain;charset=UTF-8" } });
+  }
+}
+
+// 【补丁⑪】文件夹浏览页的 HTML（公开页面，只读、不带任何管理按钮）
+function generateFolderPage(config, folder, files, subs) {
+  const segs = folder.split("/");
+  let acc = "";
+  const crumbs = [
+    `<a href="${config.domain ? "https://" + config.domain + "/" : "/"}">根目录</a>`,
+    ...segs.map((s) => {
+      acc = acc ? acc + "/" + s : s;
+      return `<a href="https://${config.domain}/${encodeFolderPath(acc)}">${escapeHtml(s)}</a>`;
+    }),
+  ];
+  const subHtml = subs.length
+    ? `<div class="subs"><div class="subs-title"><i class="fas fa-folder"></i> 子文件夹</div><div class="subs-list">${subs
+        .map((s) => `<a class="sub" href="https://${config.domain}/${encodeFolderPath(s.path)}"><i class="fas fa-folder"></i> ${escapeHtml(s.name)}</a>`)
+        .join("")}</div></div>`
+    : "";
+  const cards = files
+    .map(
+      (f) => `
+      <div class="card">
+        <a class="thumb" href="${escapeHtml(f.url)}" target="_blank">${getPreviewHtml(f.url, f.mime_type)}</a>
+        <div class="meta">
+          <div class="name" title="${escapeHtml(f.file_name)}">${escapeHtml(f.file_name)}</div>
+          <div class="size">${formatSize(f.file_size)}</div>
+        </div>
+        <div class="acts">
+          <button class="copy" data-url="${escapeHtml(f.url)}">复制链接</button>
+          <a href="${escapeHtml(f.url)}" download="${escapeHtml(f.file_name)}" target="_blank">下载</a>
+        </div>
+      </div>`,
+    )
+    .join("");
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(folder)} - 文件夹</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 18px 60px; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f4f6fa; color: #222; }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .crumbs { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
+  .crumbs a { color: #007bff; text-decoration: none; }
+  .crumbs a:hover { text-decoration: underline; }
+  .count { font-size: 13px; color: #888; margin-bottom: 14px; }
+  .subs { background: #fff; border-radius: 12px; padding: 12px 14px; margin-bottom: 18px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+  .subs-title { font-size: 13px; color: #666; margin-bottom: 8px; }
+  .subs-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sub { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; background: #eef3ff; color: #2059c9; border-radius: 999px; text-decoration: none; font-size: 13px; }
+  .sub:hover { background: #dfe9ff; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 16px; }
+  .card { background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.06); display: flex; flex-direction: column; }
+  .thumb { display: block; height: 150px; background: #eef0f4; overflow: hidden; }
+  .thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .meta { padding: 8px 10px 0; }
+  .name { font-size: 12px; word-break: break-all; line-height: 1.4; max-height: 34px; overflow: hidden; }
+  .size { font-size: 11px; color: #999; margin-top: 2px; }
+  .acts { display: flex; gap: 8px; padding: 8px 10px 12px; }
+  .acts a, .acts button { flex: 1; text-align: center; font-size: 12px; padding: 6px 0; border-radius: 8px; border: none; cursor: pointer; text-decoration: none; background: #007bff; color: #fff; }
+  .acts button { background: #e9eef7; color: #2059c9; }
+  .empty { padding: 40px; text-align: center; color: #999; background: #fff; border-radius: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><i>📁</i> ${escapeHtml(folder)}</h1>
+  <div class="crumbs">${crumbs.join(" / ")}</div>
+  <div class="count">共 ${files.length} 个文件${subs.length ? "，" + subs.length + " 个子文件夹" : ""}</div>
+  ${subHtml}
+  ${files.length ? `<div class="grid">${cards}</div>` : `<div class="empty">这个文件夹里还没有图片</div>`}
+</div>
+<script>
+  document.querySelectorAll('.acts .copy').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var url = b.getAttribute('data-url');
+      var done = function () { var t = b.textContent; b.textContent = '已复制'; setTimeout(function () { b.textContent = t; }, 1200); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, done);
+      else done();
+    });
+  });
+</script>
+</body>
+</html>`;
+}
+
 // 处理文件管理和预览
 async function handleAdminRequest(request, config) {
   try {
+    const params = new URL(request.url).searchParams;
     // 【补丁⑧】默认只列出未隐藏的；带 ?hidden=1 时把已隐藏的也列出来
-    const showHidden = new URL(request.url).searchParams.get("hidden") === "1";
-    const files = await config.database
-      .prepare(
-        `SELECT url, webp_url, fileId, message_id, created_at, file_name, webp_file_name, file_size, mime_type, COALESCE(hidden, 0) AS hidden
+    const showHidden = params.get("hidden") === "1";
+    // 【补丁⑪】文件夹筛选：?folder=旅行 只看这个文件夹；?folder=（空）= 未分类；不带参数 = 全部
+    const folderRaw = params.get("folder");
+    const folderNorm = normalizeFolderPath(folderRaw === null ? undefined : folderRaw);
+    const folderFilter = folderRaw === null ? null : folderNorm.ok ? folderNorm.path : "";
+    const deep = params.get("deep") === "1";
+
+    const where = [];
+    const binds = [];
+    if (!showHidden) where.push("COALESCE(hidden, 0) = 0");
+    if (folderFilter !== null) {
+      if (deep && folderFilter !== "") {
+        where.push("(COALESCE(folder, '') = ? OR COALESCE(folder, '') LIKE ? ESCAPE '!')");
+        binds.push(folderFilter, likePrefix(folderFilter));
+      } else {
+        where.push("COALESCE(folder, '') = ?");
+        binds.push(folderFilter);
+      }
+    }
+    const sql = `SELECT url, webp_url, fileId, message_id, created_at, file_name, webp_file_name, file_size, mime_type, COALESCE(hidden, 0) AS hidden, COALESCE(folder, '') AS folder
         FROM files
-        ${showHidden ? "" : "WHERE COALESCE(hidden, 0) = 0"}
-        ORDER BY created_at DESC`,
-      )
-      .all();
+        ${where.length ? "WHERE " + where.join(" AND ") : ""}
+        ORDER BY created_at DESC`;
+    const stmt = config.database.prepare(sql);
+    const files = await (binds.length ? stmt.bind(...binds) : stmt).all();
 
     const fileList = files.results || [];
+
+    // ---------------- 【补丁⑪】文件夹侧栏数据 ----------------
+    const folderData = await loadFolderList(config);
+    const hiddenCond = showHidden ? "" : " AND COALESCE(hidden, 0) = 0";
+    let ownCount = 0;
+    let deepCount = 0;
+    if (folderFilter === null) {
+      const r = await config.database.prepare("SELECT COUNT(*) AS c FROM files WHERE 1 = 1" + hiddenCond).first();
+      ownCount = Number(r && r.c) || 0;
+      deepCount = ownCount;
+    } else if (folderFilter === "") {
+      const r = await config.database.prepare("SELECT COUNT(*) AS c FROM files WHERE COALESCE(folder, '') = ''" + hiddenCond).first();
+      ownCount = Number(r && r.c) || 0;
+      deepCount = ownCount;
+    } else {
+      const r1 = await config.database.prepare("SELECT COUNT(*) AS c FROM files WHERE COALESCE(folder, '') = ?" + hiddenCond).bind(folderFilter).first();
+      ownCount = Number(r1 && r1.c) || 0;
+      const r2 = await config.database
+        .prepare("SELECT COUNT(*) AS c FROM files WHERE (COALESCE(folder, '') = ? OR COALESCE(folder, '') LIKE ? ESCAPE '!')" + hiddenCond)
+        .bind(folderFilter, likePrefix(folderFilter))
+        .first();
+      deepCount = Number(r2 && r2.c) || 0;
+    }
+
+    const adminUrl = (folder, useDeep, withHidden) => {
+      const qs = [];
+      if (folder !== null) qs.push("folder=" + encodeURIComponent(folder));
+      if (useDeep) qs.push("deep=1");
+      if (withHidden) qs.push("hidden=1");
+      return "/admin" + (qs.length ? "?" + qs.join("&") : "");
+    };
+    const jsArg = (s) => escapeHtml(JSON.stringify(String(s)));
+
+    const chips = [];
+    chips.push(
+      `<a class="folder-chip${folderFilter === null ? " active" : ""}" href="${adminUrl(null, false, showHidden)}"><i class="fas fa-images"></i> 全部图片<span class="fc-count">${folderData.total}</span></a>`,
+    );
+    chips.push(
+      `<a class="folder-chip${folderFilter === "" ? " active" : ""}" href="${adminUrl("", false, showHidden)}"><i class="far fa-folder-open"></i> 未分类<span class="fc-count">${folderData.uncategorized}</span></a>`,
+    );
+    for (const f of folderData.folders) {
+      const indent = "&nbsp;&nbsp;".repeat(f.depth);
+      const short = f.path.split("/").pop();
+      chips.push(
+        `<span class="folder-item">` +
+          `<a class="folder-chip${folderFilter === f.path ? " active" : ""}" href="${adminUrl(f.path, true, showHidden)}" title="${escapeHtml(f.path)}">${indent}<i class="fas fa-folder"></i> ${escapeHtml(short)}<span class="fc-count">${f.count}</span></a>` +
+          `<a class="folder-mini" href="https://${config.domain}/${encodeFolderPath(f.path)}" target="_blank" title="打开这个文件夹的公开页面（可以分享给别人）">↗</a>` +
+          `<button class="folder-mini" onclick="renameFolder(${jsArg(f.path)})" title="重命名文件夹">改名</button>` +
+          `<button class="folder-mini danger" onclick="deleteFolder(${jsArg(f.path)})" title="删除文件夹（里面的图片会回到未分类，图片本身不删）">删</button>` +
+          `</span>`,
+      );
+    }
+
+    const folderPanel =
+      `<div class="folder-panel">` +
+      `<div class="folder-head">` +
+      `<span class="fp-title"><i class="fas fa-folder-tree"></i> 文件夹</span>` +
+      `<button class="btn fp-new" onclick="createFolder()"><i class="fas fa-folder-plus"></i> 新建文件夹</button>` +
+      `<span class="fp-now">当前：${folderFilter === null ? "全部图片" : escapeHtml(folderFilter || "未分类")} · ${ownCount} 张` +
+      (folderFilter && deepCount !== ownCount ? `（含子文件夹 ${deepCount} 张）` : "") +
+      `</span>` +
+      (folderFilter ? `<a class="fp-deep" href="${adminUrl(folderFilter, !deep, showHidden)}">${deep ? "只看本层" : "含子文件夹"}</a>` : "") +
+      `</div>` +
+      `<div class="folder-list">${chips.join("")}</div>` +
+      `<div class="folder-tip">点文件夹名 = 只看这个文件夹；「↗」= 打开它的公开页面（可直接分享给别人）。移动 / 改名后，旧链接会自动 302 跳到新链接，已发布的文章不会挂。</div>` +
+      `</div>`;
+
+    const optionsHtml =
+      `<option value="">未分类（根目录）</option>` +
+      folderData.folders
+        .map((f) => `<option value="${escapeHtml(f.path)}">${"&nbsp;&nbsp;".repeat(f.depth)}${escapeHtml(f.path)}</option>`)
+        .join("");
+
+    const folderUI = {
+      panel: folderPanel,
+      optionsHtml: optionsHtml,
+      hiddenLink: adminUrl(folderFilter, deep, !showHidden),
+    };
     const fileCards = fileList
       .map((file) => {
         const createdAt = new Date(file.created_at).toISOString().replace("T", " ").split(".")[0];
@@ -624,6 +1174,7 @@ async function handleAdminRequest(request, config) {
             <div>${displayFileName}</div>
             <div>${displayFileSize}</div>
             <div>${createdAt}</div>
+            <div class="file-folder" title="所属文件夹">${file.folder ? "📁 " + escapeHtml(file.folder) : "📁 未分类"}</div>
           </div>
           <div class="file-actions">
             <button class="btn btn-copy" onclick="showQRCode('${displayUrl}')"><i class="fas fa-share"></i> 分享</button>
@@ -648,7 +1199,7 @@ async function handleAdminRequest(request, config) {
     </div>
   `;
 
-    const html = generateAdminPage(fileCards, qrModal, showHidden); // 【补丁⑧修复】
+    const html = generateAdminPage(fileCards, qrModal, showHidden, folderUI); // 【补丁⑧修复】+【补丁⑪】文件夹侧栏
     return new Response(html, {
       headers: { "Content-Type": "text/html;charset=UTF-8" },
     });
@@ -714,6 +1265,16 @@ async function handleFileRequest(request, config) {
       .first();
 
     if (!file) {
+      // 【补丁⑪】老链接救回：图片被移动 / 文件夹被重命名后，旧地址在这里 302 跳到新地址
+      //   这样已经写进 Telegraph 文章、Telegram 消息里的旧链接永远不会挂
+      if (lookupColumn === "url") {
+        try {
+          const alias = await config.database.prepare("SELECT new_url FROM redirects WHERE old_url = ?").bind(lookupValue).first();
+          if (alias && alias.new_url) return Response.redirect(alias.new_url, 302);
+        } catch (e) {
+          console.error("[warn] 查询跳转记录失败:", e);
+        }
+      }
       return new Response("文件不存在", {
         status: 404,
         headers: { "Content-Type": "text/plain;charset=UTF-8" },
@@ -1239,6 +1800,24 @@ function generateUploadPage() {
       }
       .upload-area p { line-height: 2; }
       .upload-area.dragover { border-color: #007bff; background: #f8f9fa; }
+
+      /* 【补丁⑪】上传时选择文件夹 */
+      .folder-picker {
+        display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        margin: 0 auto 14px; padding: 8px 12px; max-width: 640px;
+        background: rgba(255,255,255,0.6); border-radius: 8px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08); font-size: 14px;
+      }
+      .folder-picker select {
+        flex: 1; min-width: 180px; padding: 6px 10px; border-radius: 8px;
+        border: 1px solid rgba(0,0,0,0.15); background: #fff; font-size: 14px;
+      }
+      .fp-new-btn {
+        padding: 6px 12px; border: none; border-radius: 8px; cursor: pointer;
+        background: #007bff; color: #fff; font-size: 13px;
+      }
+      .fp-new-btn:hover { background: #0056b3; }
+      .fp-tip { color: #888; font-size: 12px; }
       
       .preview-area { margin-top: 20px; display: none; overflow-y: auto; min-height: 80px; max-height: 180px; padding-right: 6px; }
       .preview-item {
@@ -1421,6 +2000,13 @@ function generateUploadPage() {
         <h1 style="margin: 0;"><i class="fas fa-file-upload"></i> 文件上传</h1>
         <a href="/admin" class="admin-link"><i class="fas fa-list"></i> 文件管理</a>
       </div>
+      <!-- 【补丁⑪】上传到哪个文件夹 -->
+      <div class="folder-picker">
+        <span><i class="fas fa-folder"></i> 上传到：</span>
+        <select id="folderSelect"><option value="">未分类（根目录）</option></select>
+        <button type="button" class="fp-new-btn" id="folderNewBtn"><i class="fas fa-folder-plus"></i> 新建文件夹</button>
+        <span class="fp-tip">链接会自动带上文件夹路径</span>
+      </div>
       <div class="upload-area" id="uploadArea">
         <p>点击选择 或 拖拽文件到此处<br>支持 Ctrl+V 粘贴上传</p>
         <input type="file" id="fileInput" multiple style="display: none">
@@ -1517,6 +2103,60 @@ function generateUploadPage() {
       const previewArea = document.getElementById('previewArea');
       const urlArea = document.getElementById('urlArea');
       let uploadedUrls = [];
+
+      // -------------------- 【补丁⑪】文件夹选择 --------------------
+      let folderPaths = [];
+      function selectedFolder() {
+        const sel = document.getElementById('folderSelect');
+        return sel ? sel.value : '';
+      }
+      function renderFolderOptions(keep) {
+        const sel = document.getElementById('folderSelect');
+        if (!sel) return;
+        const cur = keep !== undefined ? keep : sel.value;
+        sel.innerHTML = '';
+        const first = document.createElement('option');
+        first.value = '';
+        first.textContent = '未分类（根目录）';
+        sel.appendChild(first);
+        folderPaths.forEach(function (p) {
+          const o = document.createElement('option');
+          o.value = p;
+          o.textContent = '　'.repeat(p.split('/').length - 1) + p;
+          sel.appendChild(o);
+        });
+        if (cur && folderPaths.indexOf(cur) !== -1) sel.value = cur; else sel.value = '';
+      }
+      async function loadFolderOptions(keep) {
+        try {
+          const r = await fetch('/folders');
+          const d = await r.json();
+          folderPaths = (d.folders || []).map(function (f) { return f.path; });
+          renderFolderOptions(keep);
+        } catch (e) {
+          console.warn('读取文件夹列表失败:', e);
+        }
+      }
+      (function bindNewFolderBtn() {
+        const btn = document.getElementById('folderNewBtn');
+        if (!btn) return;
+        btn.addEventListener('click', async function () {
+          const p = window.prompt('新建文件夹（可以用 / 分层，例如 文章/2026/11）', '');
+          if (!p) return;
+          const name = String(p).trim();
+          if (!name) return;
+          try {
+            const r = await fetch('/folders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'create', path: name }) });
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || '创建失败');
+            await loadFolderOptions(d.path);
+            await showAlert('文件夹「' + d.path + '」创建好了，已帮你选中', '创建成功', 'success');
+          } catch (e) {
+            await showAlert('创建失败: ' + e.message, '失败', 'error');
+          }
+        });
+      })();
+      loadFolderOptions();
 
       // 统一文件处理函数：负责校验和启动上传
       async function processFiles(files) {
@@ -1627,6 +2267,7 @@ function generateUploadPage() {
 
         const formData = new FormData();
         formData.append('file', file);
+        formData.append('folder', selectedFolder()); // 【补丁⑪】带上要上传到的文件夹
         // 【补丁③】网络错误 / 中断也要放行队列，否则后面的文件会被卡死
         xhr.addEventListener('error', () => {
           preview.querySelector('.progress-text').textContent = '✗ 网络错误';
@@ -1777,7 +2418,11 @@ function generateUploadPage() {
 }
 
 // 生成文件管理页面 /admin
-function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修复】需要知道当前是否在「显示已隐藏」视图
+function generateAdminPage(fileCards, qrModal, showHidden, folderUI) { // 【补丁⑧修复】需要知道当前是否在「显示已隐藏」视图；【补丁⑪】加上文件夹侧栏
+  // 【补丁⑪】文件夹侧栏 / 下拉框 / 「显示已隐藏」链接（保留当前筛选）——都要有兜底值，缺了也不会白屏
+  const folderPanel = (folderUI && folderUI.panel) || "";
+  const folderOptionsHtml = (folderUI && folderUI.optionsHtml) || '<option value="">未分类（根目录）</option>';
+  const hiddenLink = (folderUI && folderUI.hiddenLink) || (showHidden ? "/admin" : "/admin?hidden=1");
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
@@ -1951,6 +2596,46 @@ function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修�
       .card-pick input { width: 16px; height: 16px; cursor: pointer; margin: 0; }
       .file-card.selected { outline: 3px solid #dc3545; outline-offset: -3px; }
 
+      /* 【补丁⑪】文件夹侧栏 + 批量移动控件 */
+      .folder-panel {
+        margin: 0 0 14px; padding: 12px 14px;
+        background: rgba(255,255,255,0.55); backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        font-size: 14px;
+      }
+      .folder-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+      .fp-title { font-weight: 600; }
+      .fp-new { background: #007bff; color: #fff; font-size: 13px; }
+      .fp-now { color: #555; font-size: 13px; }
+      .fp-deep { font-size: 13px; color: #007bff; text-decoration: none; }
+      .fp-deep:hover { text-decoration: underline; }
+      .folder-list { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .folder-item { display: inline-flex; align-items: center; gap: 2px; }
+      .folder-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 5px 10px; border-radius: 999px; font-size: 13px;
+        background: #eef3ff; color: #2059c9; text-decoration: none; white-space: nowrap;
+      }
+      .folder-chip:hover { background: #dfe9ff; }
+      .folder-chip.active { background: #2059c9; color: #fff; }
+      .fc-count { font-size: 11px; opacity: 0.75; }
+      .folder-mini {
+        border: none; background: rgba(0,0,0,0.06); color: #555;
+        border-radius: 6px; padding: 3px 6px; font-size: 11px; cursor: pointer; text-decoration: none;
+      }
+      .folder-mini:hover { background: rgba(0,0,0,0.13); }
+      .folder-mini.danger { color: #b3261e; }
+      .folder-tip { margin-top: 10px; font-size: 12px; color: #888; line-height: 1.6; }
+      .file-folder { font-size: 12px; color: #2059c9; margin-top: 2px; word-break: break-all; }
+      .batch-move { display: inline-flex; align-items: center; gap: 6px; color: #555; }
+      .batch-move select {
+        max-width: 200px; padding: 5px 8px; border-radius: 8px;
+        border: 1px solid rgba(0,0,0,0.15); background: #fff; font-size: 13px;
+      }
+      .btn-move { background: #2059c9; color: #fff; }
+      .btn-move:disabled { opacity: 0.45; cursor: not-allowed; }
+
       /* 【补丁⑧】隐藏功能样式 */
       .file-card.is-hidden { opacity: 0.55; }
       .hidden-badge {
@@ -2113,13 +2798,15 @@ function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修�
     <div class="container">
       <div class="header">
         <h2><i class="fas fa-list"></i> 文件管理</h2>
-        <a href="${showHidden ? "/admin" : "/admin?hidden=1"}" class="backup"><i class="fas fa-eye${showHidden ? "" : "-slash"}"></i> ${showHidden ? "只看未隐藏" : "显示已隐藏"}</a>
+        <a href="${hiddenLink}" class="backup"><i class="fas fa-eye${showHidden ? "" : "-slash"}"></i> ${showHidden ? "只看未隐藏" : "显示已隐藏"}</a>
         <a href="/upload" class="backup"><i class="fas fa-arrow-left"></i> 返回</a>
         <div class="search-wrapper">
           <i class="fas fa-magnifying-glass"></i>
           <input type="text" class="search" placeholder="搜索文件..." id="searchInput">
         </div>
       </div>
+      <!-- 【补丁⑪】文件夹侧栏 -->
+      ${folderPanel}
       <!-- 【补丁④】批量删除操作栏 -->
       <div class="batch-bar">
         <label class="batch-all"><input type="checkbox" id="selectAllCheck"> 全选本页</label>
@@ -2128,6 +2815,11 @@ function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修�
         <button class="btn btn-hide" id="batchHideBtn" disabled><i class="fas fa-eye-slash"></i> 隐藏所选</button>
         <button class="btn batch-clear" id="batchUnhideBtn" disabled><i class="fas fa-eye"></i> 取消隐藏</button>
         <button class="btn batch-clear" id="batchClearBtn"><i class="fas fa-xmark"></i> 取消选择</button>
+        <span class="batch-move">
+          <i class="fas fa-folder-tree"></i>
+          <select id="moveSelect">${folderOptionsHtml}</select>
+          <button class="btn btn-move" id="batchMoveBtn" disabled><i class="fas fa-arrow-right"></i> 移动到</button>
+        </span>
         <span class="batch-hint">提示：一次最多 100 个</span>
       </div>
       <div class="grid" id="fileGrid">
@@ -2362,6 +3054,8 @@ function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修�
         const bu = document.getElementById('batchUnhideBtn');
         if (bh) bh.disabled = n === 0;
         if (bu) bu.disabled = n === 0;
+        const bm = document.getElementById('batchMoveBtn'); // 【补丁⑪】移动到文件夹
+        if (bm) bm.disabled = n === 0;
       }
       async function doHide(urls, hidden) {
         try {
@@ -2428,6 +3122,124 @@ function generateAdminPage(fileCards, qrModal, showHidden) { // 【补丁⑧修�
       }
       bindHideBatch('batchHideBtn', true);
       bindHideBatch('batchUnhideBtn', false);
+
+      // -------------------- 【补丁⑪】文件夹：新建 / 改名 / 删除 / 批量移动 --------------------
+      // 带输入框的弹窗（复用页面已有的 modal 样式）
+      function promptModal(title, defaultValue, placeholder) {
+        return new Promise(function (resolve) {
+          var overlay = document.getElementById('folderPrompt');
+          if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'folderPrompt';
+            overlay.className = 'modal-overlay';
+            overlay.innerHTML = '<div class="modal-box">' +
+              '<div class="modal-icon info fas fa-folder"></div>' +
+              '<div class="modal-title"></div>' +
+              '<input type="text" class="fp-input" style="width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(0,0,0,.15);font-size:14px;margin-bottom:18px;box-sizing:border-box;">' +
+              '<div class="modal-btns"></div></div>';
+            document.body.appendChild(overlay);
+            overlay.addEventListener('click', function (e) {
+              if (e.target === overlay) { overlay.classList.remove('show'); resolve(null); }
+            });
+          }
+          overlay.querySelector('.modal-title').textContent = title;
+          var input = overlay.querySelector('.fp-input');
+          input.value = defaultValue || '';
+          input.placeholder = placeholder || '';
+          var close = function (val) { overlay.classList.remove('show'); resolve(val); };
+          var btnBox = overlay.querySelector('.modal-btns');
+          btnBox.innerHTML = '';
+          var cancel = document.createElement('button');
+          cancel.textContent = '取消';
+          cancel.className = 'modal-btn secondary';
+          cancel.onclick = function () { close(null); };
+          btnBox.appendChild(cancel);
+          var okBtn = document.createElement('button');
+          okBtn.textContent = '确定';
+          okBtn.className = 'modal-btn';
+          okBtn.onclick = function () { close(input.value); };
+          btnBox.appendChild(okBtn);
+          input.onkeydown = function (e) {
+            if (e.key === 'Enter') close(input.value);
+            if (e.key === 'Escape') close(null);
+          };
+          overlay.classList.add('show');
+          setTimeout(function () { input.focus(); input.select(); }, 60);
+        });
+      }
+
+      async function folderAction(payload) {
+        try {
+          var resp = await fetch('/folders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          var data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || '操作失败');
+          return data;
+        } catch (e) {
+          await showAlert('操作失败: ' + e.message, '失败', 'error');
+          return null;
+        }
+      }
+
+      async function createFolder() {
+        var p = await promptModal('新建文件夹', '', '例如：旅行 或 文章/2026/11');
+        if (p === null || p === undefined) return;
+        p = String(p).trim();
+        if (!p) return;
+        var d = await folderAction({ action: 'create', path: p });
+        if (!d) return;
+        await showAlert('文件夹「' + d.path + '」创建好了', '创建成功', 'success');
+        location.reload();
+      }
+
+      async function renameFolder(path) {
+        var p = await promptModal('重命名文件夹：' + path, path, '新的名字（可以用 / 分层）');
+        if (p === null || p === undefined) return;
+        p = String(p).trim();
+        if (!p || p === path) return;
+        if (!(await showConfirm('确定把「' + path + '」改名为「' + p + '」吗？里面的图片链接会一起更新，老链接自动跳转，已发布的文章不会挂。', '重命名确认'))) return;
+        var d = await folderAction({ action: 'rename', old: path, new: p });
+        if (!d) return;
+        var failed = (d.failed || []).length;
+        await showAlert('重命名完成：跟着改了 ' + d.files + ' 个图片链接' + (failed ? '（有 ' + failed + ' 个因目标重名被跳过）' : ''), '重命名完成', failed ? 'warning' : 'success');
+        location.href = '/admin?folder=' + encodeURIComponent(d.new);
+      }
+
+      async function deleteFolder(path) {
+        if (!(await showConfirm('确定删除文件夹「' + path + '」吗？里面的图片不会被删，会自动回到「未分类」，老链接自动跳转。', '删除文件夹'))) return;
+        var d = await folderAction({ action: 'delete', path: path });
+        if (!d) return;
+        await showAlert('文件夹「' + d.deleted + '」已删除：' + d.files + ' 个图片回到了「未分类」', '已删除', 'success');
+        location.href = '/admin?folder=';
+      }
+
+      var batchMoveBtn = document.getElementById('batchMoveBtn');
+      if (batchMoveBtn) {
+        batchMoveBtn.addEventListener('click', async function () {
+          var urls = getCheckedUrls();
+          if (urls.length === 0) return;
+          var sel = document.getElementById('moveSelect');
+          var target = sel ? sel.value : '';
+          var label = target ? '「' + target + '」' : '「未分类」';
+          if (!(await showConfirm('确定把选中的 ' + urls.length + ' 个图片移动到 ' + label + ' 吗？', '移动确认'))) return;
+          var original = batchMoveBtn.innerHTML;
+          batchMoveBtn.disabled = true;
+          batchMoveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 移动中...';
+          try {
+            var resp = await fetch('/move-files', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls: urls, folder: target }) });
+            var data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || '移动失败');
+            var fails = (data.results || []).filter(function (x) { return !x.ok; });
+            if (fails.length) console.warn('移动失败明细:', fails);
+            await showAlert('移动完成：成功 ' + data.moved + ' / ' + data.total + ' 个' + (fails.length ? '，失败 ' + fails.length + ' 个（多半是目标文件夹里有同名文件）' : ''), '移动完成', fails.length ? 'warning' : 'success');
+            location.href = '/admin?folder=' + encodeURIComponent(target);
+          } catch (e) {
+            await showAlert('移动失败: ' + e.message, '失败', 'error');
+            batchMoveBtn.innerHTML = original;
+            updateBatchUI();
+          }
+        });
+      }
+
       // -------------------- 初始渲染 --------------------
       renderPage(currentPage);
 
