@@ -333,33 +333,65 @@ async function handleUploadRequest(request, config) {
       console.log(`[info] 图片 ${(file.size / 1024 / 1024).toFixed(1)}MB 超过 sendPhoto 上限，改用 sendDocument`);
     }
     let tgResponse = await sendToTelegram(useMethod, useField);
+    // 【补丁⑩】把响应体读成文本，后面的判断都基于这份文本
+    //   原来直接用 tgResponse.json()：body 一旦读掉就取不到原文，出错时根本查不出原因
+    let tgText = await tgResponse.text();
+    let tgData = null;
+    try {
+      tgData = JSON.parse(tgText);
+    } catch {}
+
+    // 【补丁⑩】Telegram 不只用 HTTP 状态码报错 —— 它还会用「HTTP 200 + {"ok":false}」表示失败，
+    //   最典型的就是 .webp 图片（body 里写 "wrong type of the web page content"，HTTP 状态却是 200）。
+    //   原代码只看 tgResponse.ok（HTTP 层），会把这个失败当成功继续往下走，
+    //   最后卡在「未获取到文件ID」，完全看不出真实原因。
+    const isTgOk = () => tgResponse.ok && !(tgData && tgData.ok === false);
+
     // 兜底：sendPhoto 被拒（尺寸过大 / 格式不支持）时，自动改走文档方式再试一次
-    if (!tgResponse.ok && isImageUpload && useMethod === "sendPhoto" && tgResponse.status === 400) {
-      const firstErr = await tgResponse.text();
-      console.error("[warn] sendPhoto 被拒，改用 sendDocument 重试:", firstErr);
+    //   【补丁⑩】去掉「必须 400」的限制，改成「只要 Telegram 说不行就重试」；429 除外（重试也是白等）
+    if (!isTgOk() && isImageUpload && useMethod === "sendPhoto" && tgResponse.status !== 429) {
+      console.error(`[warn] sendPhoto 被拒（HTTP ${tgResponse.status}），改用 sendDocument 重试:`, String(tgText).slice(0, 500));
       tgResponse = await sendToTelegram("sendDocument", "document");
+      tgText = await tgResponse.text();
+      try {
+        tgData = JSON.parse(tgText);
+      } catch {
+        tgData = null;
+      }
       useMethod = "sendDocument";
     }
-    if (!tgResponse.ok) {
-      const errorText = await tgResponse.text();
+    if (!isTgOk()) {
+      const errorText = tgText;
       if (tgResponse.status === 429) {
         throw new Error(`Telegram 限流（429）—— 同一频道约每分钟最多 20 条消息，请等 1 分钟再传、或一次少传几张。原始信息: ${errorText}`);
       }
       if (isImageUpload) {
-        throw new Error(`Telegram 拒绝了这张图片（状态码: ${tgResponse.status}）—— 可能超过 10MB 或尺寸过大（宽+高 > 10000）。原始信息: ${errorText}`);
+        throw new Error(`Telegram 拒绝了这张图片（状态码: ${tgResponse.status}）—— 可能超过 10MB、尺寸过大（宽+高 > 10000），或格式不被支持（如 .webp）。原始信息: ${errorText}`);
       }
       throw new Error(`Telegram API调用失败 (状态码: ${tgResponse.status}): ${errorText}`);
     }
 
-    const tgData = await tgResponse.json();
-    const result = tgData.result;
-    const messageId = result?.message_id;
+    const result = tgData && tgData.result;
+    const messageId = result && result.message_id;
+    // 【补丁⑩】把 Telegram 可能承载文件的字段全都算上
+    //   原来只认 document / video / audio / photo；一旦 Telegram 把文件归到
+    //   sticker / animation / voice / video_note，就会误报「未获取到文件ID」
+    const pickFileId = (x) => (x && typeof x === "object" && typeof x.file_id === "string" ? x.file_id : null);
     const fileId =
-      result?.document?.file_id ||
-      result?.video?.file_id ||
-      result?.audio?.file_id ||
-      (result?.photo && result.photo[result.photo.length - 1]?.file_id);
-    if (!fileId) throw new Error("未获取到文件ID");
+      pickFileId(result && result.document) ||
+      (result && Array.isArray(result.photo) && result.photo.length ? pickFileId(result.photo[result.photo.length - 1]) : null) ||
+      pickFileId(result && result.video) ||
+      pickFileId(result && result.audio) ||
+      pickFileId(result && result.sticker) ||
+      pickFileId(result && result.animation) ||
+      pickFileId(result && result.voice) ||
+      pickFileId(result && result.video_note) ||
+      // 最后兜底：扫描 result 第一层对象里任意一个 file_id
+      (result && typeof result === "object" ? Object.keys(result).reduce((acc, k) => acc || pickFileId(result[k]), null) : null);
+    if (!fileId) {
+      // 【补丁⑩】把 Telegram 的原始返回一起报出来 —— 下次一眼就能看出真实原因
+      throw new Error(`未获取到文件ID（HTTP ${tgResponse.status}；Telegram 返回：${String(tgText).slice(0, 300)}）`);
+    }
     if (!messageId) throw new Error("未获取到tg消息ID");
     const time = Date.now();
     const timestamp = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString();
@@ -1582,6 +1614,9 @@ function generateUploadPage() {
               const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
               progressText.textContent = errorMsg;
               preview.classList.add('error');
+              // 【补丁⑩】失败时也把文件大小显示出来，方便一眼判断是不是「文件太大」
+              const errMeta = preview.querySelector('.file-meta');
+              if (errMeta) errMeta.textContent = (file.name || 'Pasted Image') + ' | ' + formatSize(file.size);
             }
           } catch (e) {
             preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
